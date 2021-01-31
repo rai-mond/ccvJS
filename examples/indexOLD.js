@@ -1,5 +1,161 @@
 'use strict';
 
+const swtDetect = (imgElement, container, message, params) => {
+  // Allocate an empty ccv_dense_matrix_t* on the emscripten heap
+  const image = new CCV.ccv_dense_matrix_t();
+
+  // Read the html image element and create a new matrix into the given pointer.
+  // Input could also be video, canvas, or ImageData.
+  CCV.ccv_read(imgElement, image);
+
+  // Detect words in the image and return them in a ccv_array_t* that you're responsible for freeing.
+  const rects = CCV.ccv_swt_detect_words(image, params);
+  const rects_js = rects.toJS();
+
+  // Draw the detected rects and optionally OCR them using tesseract
+  console.log(rects_js);
+  const patches = rects_js.map((rect) => renderPatch(imgElement, rect));
+  const ocr = $('<div>');
+  message
+    .text(`Detected ${rects_js.length} text regions.`)
+    .append($('<div>').css({minHeight: 50}).append(patches))
+    .append(ocr);
+  container.empty();
+  CCV.ccv_write(image, container[0]); // This appends a new canvas into container. Could also output to an existing canvas or an ImageData.
+  container.append(rects_js.map((x) => renderRect(x)));
+  if (!(imgElement instanceof HTMLVideoElement)) {
+    loadScript('https://cdn.rawgit.com/naptha/tesseract.js/1.0.10/dist/tesseract.js').then(() => {
+      // Send the patches of detected text to OCR engine
+      patches.map((patch) => {
+        const imageData = patch.getContext('2d').getImageData(0, 0, patch.width, patch.height);
+        Tesseract
+          .recognize(imageData)
+          .then((result) => {
+            console.log(result);
+            ocr.append(result.html);
+          });
+      });
+    });
+  }
+
+  // Must explicitly free since there are no destructors in javascript
+  rects.delete();
+  image.delete();
+};
+
+const siftMatch = (imgElement1, imgElement2, container, message, params) => {
+  // TODO: Should add UI for taking a photo with webcam for one input and webcam for the other. Small enough images can still run in real time.
+  console.time('siftread1');
+  const image = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_read(imgElement1, image, CCV.CCV_IO_GRAY);
+  console.timeEnd('siftread1');
+
+  console.time('sift1');
+  const image_keypoints = new CCV.ccv_keypoint_array();
+  const image_desc = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_sift(image, image_keypoints, image_desc, 0, params);
+  const image_keypoints_js = image_keypoints.toJS();
+  console.timeEnd('sift1');
+
+  console.time('siftread2');
+  const object = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_read(imgElement2, object, CCV.CCV_IO_GRAY);
+  console.timeEnd('siftread2');
+
+  console.time('sift2');
+  const obj_keypoints = new CCV.ccv_keypoint_array();
+  const obj_desc = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_sift(object, obj_keypoints, obj_desc, 0, params);
+  const obj_keypoints_js = obj_keypoints.toJS();
+  console.timeEnd('sift2');
+
+  console.time('siftmatch');
+  const matches = CCV.ccv_sift_match(image_desc, image_keypoints, obj_desc, obj_keypoints);
+  console.timeEnd('siftmatch');
+
+  console.groupCollapsed();
+  console.log(image_keypoints_js);
+  console.log(obj_keypoints_js);
+  console.log(matches);
+  console.groupEnd('output');
+
+  message.text(`Detected ${image_keypoints_js.length} and ${obj_keypoints_js.length} keypoints. ${matches.length} matched.`);
+  container.empty();
+  CCV.ccv_write(image, container[0]);
+  CCV.ccv_write(object, container[0]);
+  container.append(renderSiftMatches(image.get_cols(), image.get_rows(), object.get_cols(), object.get_rows(), image_keypoints_js, obj_keypoints_js, matches));
+
+  obj_desc.delete();
+  obj_keypoints.delete();
+  object.delete();
+  image_desc.delete();
+  image_keypoints.delete();
+  image.delete();
+};
+
+let scdCascade = null;
+const scdDetect = (imgElement, container, message, params) => {
+  const image = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_read(imgElement, image, CCV.CCV_IO_RGB_COLOR);
+  scdCascade = scdCascade || [CCV.ccv_scd_classifier_cascade_read(CCV.CCV_SCD_FACE_FILE)];
+  const rects = CCV.ccv_scd_detect_objects(image, scdCascade, 1, params);
+  const rects_js = rects.toJS();
+
+  console.log(rects_js);
+
+  message.text(`Detected ${rects.getLength()} faces.`);
+  container.empty();
+  CCV.ccv_write(image, container[0]);
+  container.append(rects_js.map((x) => renderRect(x)));
+
+  rects.delete();
+  image.delete();
+};
+
+let icfCascade = null;
+const icfDetect = (imgElement, container, message, params) => {
+  const image = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_read(imgElement, image, CCV.CCV_IO_RGB_COLOR); // Doesn't seem to work on gray
+  icfCascade = icfCascade || [CCV.ccv_icf_read_classifier_cascade(CCV.CCV_ICF_PEDESTRIAN_FILE)];
+  const comps = CCV.ccv_icf_detect_objects(image, icfCascade, 1, params);
+  const comps_js = comps.toJS();
+
+  console.log(comps_js);
+
+  message.text(`Detected ${comps.getLength()} pedestrians.`);
+  container.empty();
+  CCV.ccv_write(image, container[0]);
+  container.append(comps_js.map((x) => renderComp(x)));
+
+  comps.delete();
+  image.delete();
+};
+
+let dpmModels = null;
+const dpmDetect = (imgElement, container, message, params) => {
+  const image = new CCV.ccv_dense_matrix_t();
+  CCV.ccv_read(imgElement, image, CCV.CCV_IO_GRAY);
+  dpmModels = dpmModels || [
+    CCV.ccv_dpm_read_mixture_model(CCV.CCV_DPM_PEDESTRIAN_FILE),
+    CCV.ccv_dpm_read_mixture_model(CCV.CCV_DPM_CAR_FILE)
+  ];
+  const rootComps = CCV.ccv_dpm_detect_objects(image, dpmModels, 1, params);
+  const rootComps_js = rootComps.toJS();
+
+  console.log(rootComps_js);
+
+  const numPedestrians = rootComps_js.filter((x) => x.classification.id === 1).length;
+  const numCars = rootComps_js.filter((x) => x.classification.id === 2).length;
+
+  message.text(`Detected ${numPedestrians} pedestrians and ${numCars} cars`);
+  container.empty();
+  CCV.ccv_write(image, container[0]);
+  container.append(rootComps_js.map((x) => renderRootComp(x)));
+
+  rootComps.delete();
+  image.delete();
+};
+
 const mserMatch = (imgElement, container, message, params) => {
   const fullImage = new CCV.ccv_dense_matrix_t();
   CCV.ccv_read(imgElement, fullImage, CCV.CCV_IO_GRAY);
